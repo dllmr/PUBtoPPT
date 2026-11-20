@@ -39,12 +39,34 @@ The tool looks for it under `C:\msys64` (ucrt64, mingw64 or clang64) as well
 as on the `PATH`; for any other location set the `PUB2RAW` environment
 variable to the full path of `pub2raw.exe`.
 
+If `uv` isn't installed yet, install it from PowerShell, then open a new
+terminal so it is on the `PATH`:
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+On a corporate or school network that inspects HTTPS traffic with its own
+certificate, downloads can fail with `invalid peer certificate: UnknownIssuer`:
+
+- For `uv`, which downloads the Python packages on the first run, add
+  `--system-certs` so it trusts the certificates Windows trusts:
+  `uv run --system-certs pub2pptx.py file.pub` (older versions of `uv` call
+  this `--native-tls`).
+- For MSYS2's `pacman`, export the organisation's root certificate from
+  Windows (`certmgr.msc` → Trusted Root Certification Authorities → Export,
+  Base-64 X.509), copy it into `/etc/pki/ca-trust/source/anchors/` with a
+  `.crt` extension, and run `update-ca-trust` in the MSYS2 shell.
+
 ## Usage
 
 ```sh
 uv run pub2pptx.py brochure.pub                 # writes brochure.pptx next to it
 uv run pub2pptx.py brochure.pub -o out/deck.pptx
 uv run pub2pptx.py *.pub -o converted/          # several files into a folder
+uv run pub2pptx.py archive/                     # every .pub in a folder, each .pptx next to its .pub
+uv run pub2pptx.py -r --skip-existing archive/  # include subfolders; skip files already converted
+uv run pub2pptx.py -r archive/ -o converted/    # subfolders recreated under converted/
 uv run pub2pptx.py menu.pub --font-map "Raleway=Calibri,Poppins=Segoe UI"
 uv run pub2pptx.py menu.pub --mode snapshot --dpi 200
 ```
@@ -56,7 +78,10 @@ Options:
 
 | Option | Meaning |
 | --- | --- |
-| `-o, --output` | Output file for a single input, or output directory for several |
+| `-o, --output` | Output file for a single input, or output directory for several (default: next to each input) |
+| `-r, --recursive` | When a folder is given, also convert `.pub` files in its subfolders |
+| `--skip-existing` | Leave a file alone if its `.pptx` already exists, e.g. to resume an interrupted batch |
+| `--timeout S` | Give up on a file that `pub2raw` can't read within S seconds (default 600) |
 | `--mode editable\|snapshot` | `editable` (default) builds native slides; `snapshot` paints one picture per page |
 | `--dpi N` | Paint resolution in snapshot mode (default 150) |
 | `--font-map A=B,...` | Substitute font names |
@@ -64,6 +89,11 @@ Options:
 | `--no-thumbnail` | Skip the embedded first-page preview (see below) |
 | `--dump-raw` | Also write the `pub2raw` dump next to the output, for debugging |
 | `-v` | Verbose logging |
+
+When converting several files, each line is numbered (`[12/9000]`), a file
+that fails or times out is reported and skipped without stopping the run, and
+a summary of converted, skipped and failed files is printed at the end. The
+exit code is 1 if any file failed.
 
 ## How it works
 
