@@ -3,7 +3,9 @@
 A single-file command line tool that converts Microsoft Publisher (`.pub`) files
 to PowerPoint (`.pptx`).
 
-Each Publisher page becomes one slide of the same size. In the default
+Each Publisher page becomes one slide of the same size. (PowerPoint slides must
+be 1–56 inches on each side; a page outside that range, such as a 60-inch
+banner, is scaled uniformly to fit and a warning says by how much.) In the default
 *editable* mode, pictures, shapes, text boxes and tables are rebuilt as native
 PowerPoint objects with their fonts, sizes, colours, alignment and positions, so
 the result can be edited in PowerPoint. A *snapshot* mode paints each page into

@@ -204,6 +204,31 @@ def emu(inches: float) -> int:
     return int(round(inches * EMU_PER_INCH))
 
 
+# PowerPoint's slide size limits (python-pptx enforces them too).
+SLIDE_MIN_IN = 1.0
+SLIDE_MAX_IN = 56.0
+
+
+def fit_slide_size(w: float, h: float) -> tuple[float, float, float]:
+    """
+    (scale, slide_w, slide_h) for a w x h inch page. The scale is 1 when the page already
+    fits PowerPoint's limits; otherwise the largest/smallest uniform scale that brings it
+    inside them, keeping the aspect ratio. A page too long and thin for any uniform scale
+    (more than 56:1) is fitted on its long side and its short side is padded up to 1 inch.
+    """
+    shrink = min(SLIDE_MAX_IN / w, SLIDE_MAX_IN / h)  # largest scale that stays <= max
+    grow = max(SLIDE_MIN_IN / w, SLIDE_MIN_IN / h)  # smallest scale that reaches >= min
+    if shrink < 1 or grow > shrink:  # too big, or too thin to fit any way: fit the long side
+        scale = shrink
+    elif grow > 1:  # too small
+        scale = grow
+    else:
+        scale = 1.0
+    # Clamp to absorb floating-point error, and pad the short side of extreme aspect ratios.
+    clamp = lambda v: min(max(v, SLIDE_MIN_IN), SLIDE_MAX_IN)  # noqa: E731
+    return scale, clamp(w * scale), clamp(h * scale)
+
+
 def rgb(v: Any) -> RGBColor | None:
     if not v:
         return None
@@ -580,11 +605,26 @@ class Renderer:
         self._native_parts: dict[str, Any] = {}
         self.warnings: list[str] = []
         first = doc.pages[0].props if doc.pages else {}
+        # Page size in document inches; everything read from the dump is in these units.
         self.page_w = length(first.get("svg:width"), 11.6929) or 11.6929
         self.page_h = length(first.get("svg:height"), 8.2677) or 8.2677
-        self.prs.slide_width = emu(self.page_w)
-        self.prs.slide_height = emu(self.page_h)
+        self.scale, slide_w, slide_h = fit_slide_size(self.page_w, self.page_h)
+        if (slide_w, slide_h) != (self.page_w, self.page_h):
+            self.warn(f"page size {self.page_w:.2f} x {self.page_h:.2f} in is outside PowerPoint's "
+                      f"{SLIDE_MIN_IN:g}-{SLIDE_MAX_IN:g} in slide limits; content scaled to "
+                      f"{self.scale:.1%} on a {slide_w:.2f} x {slide_h:.2f} in slide")
+        self.prs.slide_width = emu(slide_w)
+        self.prs.slide_height = emu(slide_h)
         self._blank = self.prs.slide_layouts[6]
+
+    # ---- units ------------------------------------------------------------ #
+    # Every document length or point size that goes into the PPTX passes through these,
+    # so a page that had to be resized to fit PowerPoint's limits is scaled uniformly.
+    def emu(self, inches: float) -> int:
+        return emu(inches * self.scale)
+
+    def pt(self, points: float) -> Pt:
+        return Pt(points * self.scale)
 
     # ---- top level -------------------------------------------------------- #
     def render(self) -> Presentation:
@@ -658,7 +698,7 @@ class Renderer:
     def add_picture(self, slide, data: bytes, mime: str, x: float, y: float, w: float, h: float):
         """A Picture shape from image bytes at (x, y, w, h) inches; None if the image is unusable."""
         try:
-            return slide.shapes.add_picture(io.BytesIO(data), emu(x), emu(y), emu(w), emu(h))
+            return slide.shapes.add_picture(io.BytesIO(data), self.emu(x), self.emu(y), self.emu(w), self.emu(h))
         except Exception:
             pass
         rId = self.image_rId(slide, data, mime)
@@ -667,7 +707,7 @@ class Renderer:
         from pptx.oxml.shapes.picture import CT_Picture
         shapes = slide.shapes
         shape_id = shapes._next_shape_id
-        pic = CT_Picture.new_pic(shape_id, f"Picture {shape_id - 1}", "image", rId, emu(x), emu(y), emu(w), emu(h))
+        pic = CT_Picture.new_pic(shape_id, f"Picture {shape_id - 1}", "image", rId, self.emu(x), self.emu(y), self.emu(w), self.emu(h))
         shapes._spTree.append(pic)
         return shapes[-1]
 
@@ -685,8 +725,9 @@ class Renderer:
         blip = blipFill.makeelement(qn("a:blip"), {qn("r:embed"): rId})
         blipFill.append(blip)
         if tile:
+            tile_scale = str(int(round(100000 * self.scale)))  # tiles shrink/grow with the page
             blipFill.append(blipFill.makeelement(
-                qn("a:tile"), {"tx": "0", "ty": "0", "sx": "100000", "sy": "100000", "flip": "none", "algn": "tl"}))
+                qn("a:tile"), {"tx": "0", "ty": "0", "sx": tile_scale, "sy": tile_scale, "flip": "none", "algn": "tl"}))
         else:
             stretch = blipFill.makeelement(qn("a:stretch"), {})
             stretch.append(stretch.makeelement(qn("a:fillRect"), {}))
@@ -743,7 +784,7 @@ class Renderer:
             shape.line.color.rgb = color
             w = length(style.get("svg:stroke-width"))
             if w is not None:
-                shape.line.width = emu(max(w, 0.001))
+                shape.line.width = self.emu(max(w, 0.001))
             if stroke == "dash":
                 shape.line.dash_style = MSO_LINE_DASH_STYLE.DASH
 
@@ -779,7 +820,7 @@ class Renderer:
             case "ellipse":
                 cx, cy = length(p.get("svg:cx"), 0.0), length(p.get("svg:cy"), 0.0)
                 rx, ry = length(p.get("svg:rx"), 0.0), length(p.get("svg:ry"), 0.0)
-                shp = slide.shapes.add_shape(MSO_SHAPE.OVAL, emu(cx - rx), emu(cy - ry), emu(2 * rx), emu(2 * ry))
+                shp = slide.shapes.add_shape(MSO_SHAPE.OVAL, self.emu(cx - rx), self.emu(cy - ry), self.emu(2 * rx), self.emu(2 * ry))
                 self.apply_style(slide, shp, st)
                 if rot:
                     shp.rotation = rot
@@ -801,7 +842,7 @@ class Renderer:
                     pic.rotation = angle
             return
         kind = MSO_SHAPE.ROUNDED_RECTANGLE if rounded else MSO_SHAPE.RECTANGLE
-        shp = slide.shapes.add_shape(kind, emu(x), emu(y), emu(w), emu(h))
+        shp = slide.shapes.add_shape(kind, self.emu(x), self.emu(y), self.emu(w), self.emu(h))
         if rounded and min(w, h) > 0:
             try:
                 shp.adjustments[0] = min(0.5, rounded / min(w, h))
@@ -817,10 +858,10 @@ class Renderer:
             return
         x0, y0, x1, y1 = bbox
         w, h = max(x1 - x0, 1e-4), max(y1 - y0, 1e-4)
-        W, H = emu(w), emu(h)
+        W, H = self.emu(w), self.emu(h)
         builder = slide.shapes.build_freeform(0, 0, scale=1.0)
         builder.add_line_segments([(W, 0), (W, H), (0, H)], close=True)
-        shp = builder.convert_to_shape(emu(x0), emu(y0))
+        shp = builder.convert_to_shape(self.emu(x0), self.emu(y0))
         # Rewrite the path with the real geometry.
         pathLst = shp._element.spPr.find(qn("a:custGeom")).find(qn("a:pathLst"))
         for el in list(pathLst):
@@ -831,7 +872,7 @@ class Renderer:
         pathLst.append(path)
 
         def pt(x, y):
-            return {"x": str(int(round((x - x0) * EMU_PER_INCH))), "y": str(int(round((y - y0) * EMU_PER_INCH)))}
+            return {"x": str(self.emu(x - x0)), "y": str(self.emu(y - y0))}
 
         def add(tag, *coords):
             el = path.makeelement(qn(tag), {})
@@ -866,15 +907,15 @@ class Renderer:
         p = item.props
         x, y = length(p.get("svg:x"), 0.0), length(p.get("svg:y"), 0.0)
         w, h = max(length(p.get("svg:width"), 1.0), 0.05), max(length(p.get("svg:height"), 0.5), 0.05)
-        shp = slide.shapes.add_textbox(emu(x), emu(y), emu(w), emu(h))
+        shp = slide.shapes.add_textbox(self.emu(x), self.emu(y), self.emu(w), self.emu(h))
         self.apply_style(slide, shp, item.style)
         tf = shp.text_frame
         tf.word_wrap = True
         tf.auto_size = MSO_AUTO_SIZE.NONE
-        tf.margin_left = emu(length(p.get("fo:padding-left"), 0.04))
-        tf.margin_right = emu(length(p.get("fo:padding-right"), 0.04))
-        tf.margin_top = emu(length(p.get("fo:padding-top"), 0.04))
-        tf.margin_bottom = emu(length(p.get("fo:padding-bottom"), 0.04))
+        tf.margin_left = self.emu(length(p.get("fo:padding-left"), 0.04))
+        tf.margin_right = self.emu(length(p.get("fo:padding-right"), 0.04))
+        tf.margin_top = self.emu(length(p.get("fo:padding-top"), 0.04))
+        tf.margin_bottom = self.emu(length(p.get("fo:padding-bottom"), 0.04))
         tf.vertical_anchor = _VALIGN.get(str(p.get("draw:textarea-vertical-align", "top")), MSO_ANCHOR.TOP)
         self.fill_text_frame(tf, item.paragraphs)
         rot = as_float(p.get("librevenge:rotate"), 0.0)
@@ -916,21 +957,21 @@ class Renderer:
         # libmspub occasionally emits absurd margins (thousands of inches); ignore those.
         ml = length(pr.get("fo:margin-left"))
         if ml is not None and abs(ml) < self.page_w:
-            pPr.set("marL", str(emu(max(ml, 0))))
+            pPr.set("marL", str(self.emu(max(ml, 0))))
         mr = length(pr.get("fo:margin-right"))
         if mr is not None and 0 <= mr < self.page_w:
-            pPr.set("marR", str(emu(mr)))
+            pPr.set("marR", str(self.emu(mr)))
         ti = length(pr.get("fo:text-indent"))
         if ti is not None and abs(ti) < self.page_w:
-            pPr.set("indent", str(emu(ti)))
+            pPr.set("indent", str(self.emu(ti)))
             if ti < 0 and "marL" not in pPr.attrib:
                 # hanging indent needs a left margin at least as big
-                pPr.set("marL", str(emu(-ti)))
+                pPr.set("marL", str(self.emu(-ti)))
         mt, mb = length(pr.get("fo:margin-top")), length(pr.get("fo:margin-bottom"))
         if mt is not None and 0 <= mt < 2:
-            pp.space_before = Pt(mt * 72)
+            pp.space_before = self.pt(mt * 72)
         if mb is not None and 0 <= mb < 2:
-            pp.space_after = Pt(mb * 72)
+            pp.space_after = self.pt(mb * 72)
         lh = pr.get("fo:line-height")
         if lh is not None:
             s = str(lh).strip()
@@ -939,7 +980,7 @@ class Renderer:
             else:
                 lv = length(s)
                 if lv and lv > 0:
-                    pp.line_spacing = Pt(lv * 72)
+                    pp.line_spacing = self.pt(lv * 72)
         if para.bullet:
             for tag in ("a:buNone", "a:buChar", "a:buAutoNum"):
                 for el in pPr.findall(qn(tag)):
@@ -978,7 +1019,7 @@ class Renderer:
             fs = length(props.get("fo:font-size"))
             size_pt = fs * 72 if fs else None
         if size_pt:
-            end.set("sz", str(int(round(max(size_pt, 1) * 100))))
+            end.set("sz", str(int(round(max(size_pt * self.scale, 1) * 100))))
         name = props.get("style:font-name")
         if name and end.find(qn("a:latin")) is None:
             end.append(end.makeelement(qn("a:latin"), {"typeface": self.font_map.get(name, name)}))
@@ -990,7 +1031,7 @@ class Renderer:
             f.name = self.font_map.get(name, name)
         fs = length(props.get("fo:font-size"))
         if fs:
-            f.size = Pt(max(fs * 72, 1))
+            f.size = Pt(max(fs * 72 * self.scale, 1))  # PowerPoint's minimum is 1pt
         if str(props.get("fo:font-weight", "")).lower() in ("bold", "700", "800", "900"):
             f.bold = True
         if str(props.get("fo:font-style", "")).lower() in ("italic", "oblique"):
@@ -1185,7 +1226,7 @@ class Renderer:
             return
         x, y, w, h, col_w, row_h, n_cols, blank_pt, table_min = layout
         n_rows = len(item.rows)
-        gf = slide.shapes.add_table(n_rows, n_cols, emu(x), emu(y), emu(w), emu(h))
+        gf = slide.shapes.add_table(n_rows, n_cols, self.emu(x), self.emu(y), self.emu(w), self.emu(h))
         tbl = gf.table
         tbl.first_row = False
         tbl.horz_banding = False
@@ -1195,17 +1236,17 @@ class Renderer:
             tbl._tbl.tblPr.append(style_id)
         style_id.text = NO_STYLE_NO_GRID
         for i, cw in enumerate(col_w):
-            tbl.columns[i].width = emu(max(cw, 0.01))
+            tbl.columns[i].width = self.emu(max(cw, 0.01))
         for i, rh in enumerate(row_h):
-            tbl.rows[i].height = emu(max(rh, 0.01))
+            tbl.rows[i].height = self.emu(max(rh, 0.01))
 
         # Defaults: transparent cells, no borders, small margins.
         for r in range(n_rows):
             for c in range(n_cols):
                 cell = tbl.cell(r, c)
                 cell.fill.background()
-                cell.margin_left = cell.margin_right = emu(0.04)
-                cell.margin_top = cell.margin_bottom = emu(0.02)
+                cell.margin_left = cell.margin_right = self.emu(0.04)
+                cell.margin_top = cell.margin_bottom = self.emu(0.02)
                 self._cell_borders(cell, {})
 
         merges: list[tuple[int, int, int, int]] = []
@@ -1222,7 +1263,7 @@ class Renderer:
                 for side in ("left", "right", "top", "bottom"):
                     v = length(cp.get(f"fo:padding-{side}", cp.get("fo:padding")))
                     if v is not None:
-                        setattr(cell, f"margin_{side}", emu(v))
+                        setattr(cell, f"margin_{side}", self.emu(v))
                 va = str(cp.get("style:vertical-align", cp.get("draw:textarea-vertical-align", "top"))).lower()
                 cell.vertical_anchor = _VALIGN.get(va, MSO_ANCHOR.TOP)
                 self._cell_borders(cell, cp)
@@ -1262,7 +1303,7 @@ class Renderer:
                 ln.set("w", "0")
                 ln.append(ln.makeelement(qn("a:noFill"), {}))
             else:
-                ln.set("w", str(emu(width or 0.01)))
+                ln.set("w", str(self.emu(width or 0.01)))
                 sf = ln.makeelement(qn("a:solidFill"), {})
                 sf.append(sf.makeelement(qn("a:srgbClr"), {"val": str(color)}))
                 ln.append(sf)
