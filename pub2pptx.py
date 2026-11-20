@@ -27,6 +27,7 @@ Examples:
   uv run pub2pptx.py brochure.pub                  # -> brochure.pptx
   uv run pub2pptx.py brochure.pub -o out/deck.pptx
   uv run pub2pptx.py *.pub -o converted/           # many files into a folder
+  uv run pub2pptx.py -r --skip-existing archive/   # every .pub under a folder, resumable
   uv run pub2pptx.py menu.pub --font-map "Raleway=Calibri,Poppins=Segoe UI"
   uv run pub2pptx.py menu.pub --mode snapshot --dpi 200
 """
@@ -58,6 +59,7 @@ from pptx.oxml.ns import qn
 from pptx.util import Pt
 
 VERBOSE = False
+PUB2RAW_TIMEOUT = 600  # seconds allowed for reading one .pub file (--timeout)
 EMU_PER_INCH = 914400
 
 
@@ -1829,7 +1831,9 @@ def run_pub2raw(pub: Path) -> str:
         src = Path(tmp.name) / "input.pub"
         shutil.copyfile(pub, src)
     try:
-        res = subprocess.run([exe, str(src)], capture_output=True, timeout=600)
+        res = subprocess.run([exe, str(src)], capture_output=True, timeout=PUB2RAW_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"pub2raw timed out after {PUB2RAW_TIMEOUT:g}s reading the file") from None
     finally:
         if tmp is not None:
             tmp.cleanup()
@@ -1969,8 +1973,31 @@ def parse_font_map(spec: str | None) -> dict[str, str]:
     return m
 
 
+def collect_inputs(paths: list[Path], recursive: bool) -> list[tuple[Path, Path]] | None:
+    """
+    Expand the command-line inputs into (pub file, output path relative to the output
+    folder) pairs. A folder contributes the .pub files directly inside it, or anywhere below
+    it with `recursive`, keeping their subfolders in the relative path so that same-named
+    files in different folders don't overwrite each other. None if an input doesn't exist.
+    """
+    found: list[tuple[Path, Path]] = []
+    for p in paths:
+        if not p.exists():
+            log(f"error: {p} does not exist")
+            return None
+        if not p.is_dir():
+            found.append((p, Path(p.name)))
+            continue
+        candidates = p.rglob("*") if recursive else p.iterdir()
+        pubs = sorted(f for f in candidates if f.suffix.lower() == ".pub" and f.is_file())
+        if not pubs:
+            log(f"warning: no .pub files in {p}" + ("" if recursive else " (use -r to include subfolders)"))
+        found += [(f, f.relative_to(p)) for f in pubs]
+    return found
+
+
 def main(argv: list[str] | None = None) -> int:
-    global VERBOSE
+    global VERBOSE, PUB2RAW_TIMEOUT
     for stream in (sys.stdout, sys.stderr):
         # Never fail on a file name the console encoding can't show (legacy Windows code pages).
         try:
@@ -1978,9 +2005,16 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:
             pass
     ap = argparse.ArgumentParser(prog="pub2pptx", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("inputs", nargs="+", type=Path, help="Publisher .pub file(s)")
+    ap.add_argument("inputs", nargs="+", type=Path, help="Publisher .pub file(s), or folders of them")
     ap.add_argument("-o", "--output", type=Path,
-                    help="output .pptx for a single input, or output directory for several")
+                    help="output .pptx for a single input, or output directory for several "
+                         "(default: next to each input)")
+    ap.add_argument("-r", "--recursive", action="store_true",
+                    help="also convert .pub files in subfolders of the folders given")
+    ap.add_argument("--skip-existing", action="store_true",
+                    help="leave a file alone if its .pptx already exists (to resume an interrupted batch)")
+    ap.add_argument("--timeout", type=float, default=PUB2RAW_TIMEOUT, metavar="SECONDS",
+                    help=f"give up on a file that pub2raw can't read in this time (default {PUB2RAW_TIMEOUT})")
     ap.add_argument("--mode", choices=("editable", "snapshot"), default="editable",
                     help="editable (default): native slides; snapshot: one painted picture per page")
     ap.add_argument("--dpi", type=int, default=150, help="paint resolution for snapshot mode (default 150)")
@@ -1995,41 +2029,56 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     VERBOSE = args.verbose
+    if args.timeout <= 0:
+        ap.error("--timeout must be greater than 0")
+    PUB2RAW_TIMEOUT = args.timeout
 
-    inputs: list[Path] = []
-    for p in args.inputs:
-        if not p.exists():
-            log(f"error: {p} does not exist")
-            return 2
-        inputs.append(p)
+    inputs = collect_inputs(args.inputs, args.recursive)
+    if inputs is None:
+        return 2
+    if not inputs:
+        log("error: no .pub files to convert")
+        return 2
 
     out_dir: Path | None = None
     out_file: Path | None = None
     if args.output:
-        if len(inputs) > 1 or args.output.is_dir() or args.output.suffix.lower() != ".pptx":
+        several = len(inputs) > 1 or any(p.is_dir() for p in args.inputs)
+        if several and args.output.suffix.lower() == ".pptx" and not args.output.is_dir():
+            ap.error(f"-o {args.output} names a single .pptx file, but there are several inputs; give a folder")
+        if several or args.output.is_dir() or args.output.suffix.lower() != ".pptx":
             out_dir = args.output
         else:
             out_file = args.output
     ext = ".pptx"
     font_map = parse_font_map(args.font_map)
 
-    failures = 0
-    for pub in inputs:
+    total = len(inputs)
+    converted = skipped = failures = 0
+    for i, (pub, rel) in enumerate(inputs, 1):
+        progress = f"[{i}/{total}] " if total > 1 else ""
         if out_file:
             out = out_file
         elif out_dir:
-            out = out_dir / (pub.stem + ext)
+            out = out_dir / rel.with_suffix(ext)
         else:
             out = pub.with_suffix(ext)
+        if args.skip_existing and out.exists():
+            skipped += 1
+            print(f"{progress}{pub}: skipped, {out} already exists", flush=True)
+            continue
         try:
             convert_one(pub, out, args.mode, args.dpi, font_map, args.dump_raw, args.blank_size,
                         not args.no_thumbnail)
-            print(f"{pub} -> {out}")
+            converted += 1
+            print(f"{progress}{pub} -> {out}", flush=True)
         except Exception as e:
             failures += 1
-            log(f"error: {pub}: {e}")
+            log(f"error: {progress}{pub}: {e}")
             if VERBOSE:
                 traceback.print_exc()
+    if total > 1:
+        print(f"{converted} converted, {skipped} skipped, {failures} failed", flush=True)
     return 1 if failures else 0
 
 
